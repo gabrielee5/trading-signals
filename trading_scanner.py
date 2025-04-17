@@ -335,6 +335,8 @@ class TradingScanner:
     
     def _scanner_thread(self):
         """Thread function for continuous market scanning."""
+        last_process_time = {}  # Track last processing time for each timeframe
+        
         while self.running:
             try:
                 # Update pair list every refresh_period
@@ -343,21 +345,48 @@ class TradingScanner:
                     if elapsed >= self.pairlist_config.get("refresh_period", 1800):
                         self.update_pair_list()
                         self.last_pairlist_update = time.time()
+                        # Print current list of assets being analyzed
+                        logger.info(f"Whitelist pairs ({len(self.pairs)}): {self.pairs}")
                 else:
                     self.update_pair_list()
                     self.last_pairlist_update = time.time()
+                    # Print initial list of assets being analyzed
+                    logger.info(f"Whitelist pairs ({len(self.pairs)}): {self.pairs}")
                 
-                # Scan the market
-                signals = self.scan_market()
+                # Get strategy timeframes
+                timeframes = self.strategy.get_timeframes()
+                current_time = time.time()
+                should_process = False
                 
-                if signals:
-                    logger.info(f"Found {len(signals)} signals in this iteration")
+                # Check if any timeframe needs processing
+                for tf in timeframes:
+                    tf_seconds = self.market_cache.get_timeframe_seconds(tf)
+                    
+                    # Initialize if not yet tracked
+                    if tf not in last_process_time:
+                        last_process_time[tf] = 0
+                    
+                    # Check if a new candle is available
+                    elapsed = current_time - last_process_time[tf]
+                    if elapsed >= tf_seconds:
+                        should_process = True
+                        last_process_time[tf] = current_time - (current_time % tf_seconds)
+                        logger.info(f"Processing new {tf} candle")
+                
+                # Process data only if new candles are available
+                if should_process:
+                    # Scan the market
+                    signals = self.scan_market()
+                    
+                    if signals:
+                        logger.info(f"Found {len(signals)} signals in this iteration")
+                    # else:
+                        # logger.info("No signals found in this iteration")
                 else:
-                    logger.info("No signals found in this iteration")
+                    logger.debug("No new candles available for processing")
                 
-                # Wait for a defined interval before next scan
-                scan_interval = self.strategy.get_scan_interval()
-                time.sleep(scan_interval)
+                # Always wait exactly 1 minute before the next check
+                time.sleep(60)
                 
             except Exception as e:
                 logger.error(f"Error in scanner thread: {str(e)}")
@@ -414,6 +443,7 @@ def main():
         # Keep the main thread alive
         while True:
             try:
+                # print("---RUNNING---")
                 time.sleep(1)
             except KeyboardInterrupt:
                 print("\nShutting down scanner...")

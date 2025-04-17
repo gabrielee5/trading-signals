@@ -85,7 +85,7 @@ class SMACrossStrategy(BaseStrategy):
         Returns:
             dict or None: Signal dict if a signal is found, None otherwise
         """
-        # Get the 1h data for primary analysis
+        # Get the 1h data for primary analysis - make a deep copy to avoid warnings
         df = data['1h'].copy()
         
         # Calculate indicators using custom functions
@@ -93,10 +93,11 @@ class SMACrossStrategy(BaseStrategy):
         df['slow_ma'] = simple_moving_average(df, self.slow_ma, 'close')
         df['volume_ma'] = volume_sma(df, self.volume_ma)
         
-        # Calculate crossover
+        # Create crossover column
         df['crossover'] = np.zeros(len(df))
+        crossover = np.zeros(len(df))
         
-        # Detect crossovers
+        # Detect crossovers - avoid chained assignment
         for i in range(1, len(df)):
             if (np.isnan(df['fast_ma'].iloc[i-1]) or np.isnan(df['slow_ma'].iloc[i-1]) or 
                 np.isnan(df['fast_ma'].iloc[i]) or np.isnan(df['slow_ma'].iloc[i])):
@@ -104,10 +105,13 @@ class SMACrossStrategy(BaseStrategy):
                 
             if (df['fast_ma'].iloc[i-1] < df['slow_ma'].iloc[i-1] and 
                 df['fast_ma'].iloc[i] > df['slow_ma'].iloc[i]):
-                df['crossover'].iloc[i] = 1  # Bullish crossover
+                crossover[i] = 1  # Bullish crossover
             elif (df['fast_ma'].iloc[i-1] > df['slow_ma'].iloc[i-1] and 
                   df['fast_ma'].iloc[i] < df['slow_ma'].iloc[i]):
-                df['crossover'].iloc[i] = -1  # Bearish crossover
+                crossover[i] = -1  # Bearish crossover
+        
+        # Assign the whole array at once to avoid chained assignment
+        df.loc[:, 'crossover'] = crossover
         
         # Get the latest candle
         latest_index = -1
@@ -468,6 +472,173 @@ class RSIStrategy(BaseStrategy):
         
         return None
 
+class VolatilityStrategy(BaseStrategy):
+    """
+    RSI-based strategy that looks for oversold/overbought conditions
+    with trend confirmation using custom indicators.
+    """
+    
+    def __init__(self, atr_period=14, atr_multiplier=2.0):
+        """
+        Initialize the strategy parameters.
+        
+        Args:
+            rsi_period (int): RSI period
+            oversold (int): Oversold threshold
+            overbought (int): Overbought threshold
+        """
+        self.name = "Volatility Strategy"
+        self.atr_period = atr_period
+        self.atr_multiplier = atr_multiplier
+    
+    def get_timeframes(self):
+        """Required timeframes for this strategy."""
+        return ['5m']
+    
+    def get_scan_interval(self):
+        """Scanning interval in seconds."""
+        return 300  # 5 minutes
+    
+    def analyze(self, symbol, data):
+        """
+        Analyze the data and return a signal if found.
+        
+        Args:
+            symbol (str): Symbol being analyzed
+            data (dict): Dictionary of DataFrames for each timeframe
+            
+        Returns:
+            dict or None: Signal dict if a signal is found, None otherwise
+        """
+        # Calculate RSI for all timeframes
+        signals = {}
+        
+        for tf in self.get_timeframes():
+            df = data[tf].copy()
+            
+            # Calculate RSI using custom function
+            df['atr'] = average_true_range(df, self.atr_period)
+            
+            # Calculate simple moving average for trend
+            df['sma50'] = simple_moving_average(df, 50, 'close')
+            
+            # Need at least 2 candles for crossover detection
+            if len(df) < self.atr_period + 1:
+                continue
+            
+            # Get the latest and previous candles
+            latest = df.iloc[-1]
+            prev = df.iloc[-2]
+            
+            # Check if RSI values are valid
+            if np.isnan(prev['atr']) or np.isnan(latest['atr']):
+                continue
+            
+            # RSI crossing up through oversold
+            if prev['rsi'] < self.oversold and latest['rsi'] > self.oversold:
+                signals[tf] = {
+                    'type': 'BUY',
+                    'condition': 'Oversold',
+                    'rsi': latest['rsi'],
+                    'trend': latest['close'] > latest['sma50']
+                }
+            
+            # RSI crossing down through overbought
+            elif prev['rsi'] > self.overbought and latest['rsi'] < self.overbought:
+                signals[tf] = {
+                    'type': 'SELL',
+                    'condition': 'Overbought',
+                    'rsi': latest['rsi'],
+                    'trend': latest['close'] < latest['sma50']
+                }
+        
+        # Check for confluence across timeframes
+        if '1h' in signals and '4h' in signals:
+            # Both timeframes show the same signal type
+            if signals['1h']['type'] == signals['4h']['type']:
+                signal_type = signals['1h']['type']
+                
+                # Daily trend confirmation
+                daily_df = data['1d'].copy()
+                daily_df['sma50'] = simple_moving_average(daily_df, 50, 'close')
+                daily_trend = data['1d'].iloc[-1]['close'] > daily_df['sma50'].iloc[-1]
+                
+                # Ensure trend alignment
+                if (signal_type == 'BUY' and daily_trend) or (signal_type == 'SELL' and not daily_trend):
+                    return {
+                        'symbol': symbol,
+                        'type': signal_type,
+                        'price': data['1h'].iloc[-1]['close'],
+                        'time': data['1h'].iloc[-1]['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+                        'timeframe': '1h/4h',
+                        'strategy': self.name,
+                        'rsi_1h': signals['1h']['rsi'],
+                        'rsi_4h': signals['4h']['rsi']
+                    }
+        
+        return None
+
+class SimplePriceStrategy(BaseStrategy):
+    """
+    A very simple price comparison strategy for testing purposes.
+    Generates a BUY signal if the current candle close is higher than the previous candle close.
+    """
+    
+    def __init__(self):
+        """Initialize the strategy parameters."""
+        self.name = "Simple Price Comparison"
+    
+    def get_timeframes(self):
+        """Required timeframes for this strategy."""
+        return ['1m']
+    
+    def get_scan_interval(self):
+        """Scanning interval in seconds."""
+        return 15  # 15 seconds for quick testing
+    
+    def analyze(self, symbol, data):
+        """
+        Analyze the data and return a signal if found.
+        
+        Args:
+            symbol (str): Symbol being analyzed
+            data (dict): Dictionary of DataFrames for each timeframe
+            
+        Returns:
+            dict or None: Trading signal if found, None otherwise
+        """
+        # Get the 1m data for analysis
+        df = data['1m'].copy()
+        
+        # Need at least 2 candles
+        if len(df) < 2:
+            return None
+        
+        # Get the latest and previous candle
+        latest = df.iloc[-1]
+        previous = df.iloc[-2]
+        
+        # Simple condition: Buy if current close > previous close
+        if latest['close'] > previous['close']:
+            # Convert numpy values to native Python float to prevent np.float64 in output
+            current_close = float(latest['close']) 
+            prev_close = float(previous['close'])
+            
+            # Return BUY signal
+            return {
+                'symbol': symbol,
+                'type': 'BUY',
+                'price': current_close,  # Using converted float
+                'time': latest['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+                'timeframe': '1m',
+                'strategy': self.name,
+                'prev_close': prev_close,  # Using converted float
+                'current_close': current_close  # Using converted float
+            }
+        
+        # Could add a SELL signal when price drops, but keeping it simple for now
+        return None
+    
 # Factory function to get strategy instance
 def get_strategy(strategy_name="SMACrossStrategy"):
     """
@@ -483,7 +654,8 @@ def get_strategy(strategy_name="SMACrossStrategy"):
         "SMACrossStrategy": SMACrossStrategy(),
         "ATRBreakoutStrategy": ATRBreakoutStrategy(),
         "VolumeBreakoutStrategy": VolumeBreakoutStrategy(),
-        "RSIStrategy": RSIStrategy()
+        "RSIStrategy": RSIStrategy(),
+        "SimplePriceStrategy": SimplePriceStrategy()
     }
     
     return strategies.get(strategy_name, SMACrossStrategy())
