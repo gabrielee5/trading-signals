@@ -10,6 +10,8 @@ import numpy as np
 from datetime import datetime
 import threading
 import telegram
+from telegram.request import HTTPXRequest
+import asyncio
 from strategies_custom import get_strategy
 from cache_manager import MarketDataCache
 
@@ -107,18 +109,38 @@ class TradingScanner:
         except Exception as e:
             logger.error(f"Error initializing Telegram bot: {str(e)}")
             self.telegram_config["enabled"] = False
-    
+
+    async def _send_telegram_message_async(self, message):
+        """Send a message via Telegram asynchronously."""
+        if not self.telegram_config["enabled"] or not self.telegram_bot:
+            return
+            
+        try:
+            request = HTTPXRequest(connection_pool_size=8)
+            bot = telegram.Bot(token=self.telegram_config["token"], request=request)
+            await bot.send_message(
+                chat_id=self.telegram_config["chat_id"],
+                text=message,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Error sending Telegram message: {str(e)}")
+
     def send_telegram_message(self, message):
         """Send a message via Telegram if enabled."""
-        if self.telegram_config["enabled"] and self.telegram_bot:
-            try:
-                self.telegram_bot.send_message(
-                    chat_id=self.telegram_config["chat_id"],
-                    text=message,
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                logger.error(f"Error sending Telegram message: {str(e)}")
+        if not self.telegram_config["enabled"] or not self.telegram_bot:
+            return
+        
+        try:
+            # Create a new event loop for each message
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Run the async function in the new loop
+            loop.run_until_complete(self._send_telegram_message_async(message))
+            loop.close()
+        except Exception as e:
+            logger.error(f"Error sending Telegram message: {str(e)}")
     
     def update_pair_list(self):
         """Update the list of cryptocurrency pairs to monitor."""
@@ -130,22 +152,43 @@ class TradingScanner:
             if whitelist:
                 self.pairs = whitelist
             else:
-                # Otherwise use the dynamic pairlist configuration
+                # Get all available markets
                 markets = self.exchange.fetch_markets()
-                
-                # Filter by asset type
                 asset_type = self.exchange_config.get("asset_type", "spot")
-                filtered_markets = [m for m in markets if m['type'] == asset_type]
                 
-                # Get volume information if using VolumePairList
-                if self.pairlist_config["method"] == "VolumePairList":
+                # Filter by asset type based on the Bybit API response structure
+                if asset_type == "perpetual":
+                    # For perpetual contracts, check for type = swap and symbol ending with :USDT
+                    filtered_markets = [
+                        m for m in markets 
+                        if m['type'] == 'swap' and m['symbol'].endswith(':USDT')
+                    ]
+                elif asset_type == "spot":
+                    filtered_markets = [m for m in markets if m['type'] == 'spot']
+                elif asset_type == "future":
+                    filtered_markets = [m for m in markets if m['type'] == 'future']
+                elif asset_type == "option":
+                    filtered_markets = [m for m in markets if m['type'] == 'option']
+                else:
+                    filtered_markets = [m for m in markets if m['type'] == asset_type]
+                
+                # If entire_universe is true, use all available assets for the specific type
+                if self.pairlist_config.get("entire_universe", False):
+                    self.pairs = [market['symbol'] for market in filtered_markets]
+                    logger.info(f"Using entire universe: {len(self.pairs)} {asset_type} pairs")
+                
+                # Otherwise use the dynamic pairlist configuration
+                elif self.pairlist_config["method"] == "VolumePairList":
                     # Get 24h ticker data for all pairs
                     tickers = self.exchange.fetch_tickers()
+                    
+                    # Create a set of valid symbols from filtered markets
+                    valid_symbols = {market['symbol'] for market in filtered_markets}
                     
                     # Sort by volume
                     sort_key = self.pairlist_config.get("sort_key", "quoteVolume")
                     sorted_tickers = sorted(
-                        tickers.items(), 
+                        [(symbol, ticker) for symbol, ticker in tickers.items() if symbol in valid_symbols],
                         key=lambda x: x[1].get(sort_key, 0), 
                         reverse=True
                     )
@@ -380,12 +423,11 @@ class TradingScanner:
                     
                     if signals:
                         logger.info(f"Found {len(signals)} signals in this iteration")
-                    # else:
-                        # logger.info("No signals found in this iteration")
                 else:
                     logger.debug("No new candles available for processing")
                 
                 # Always wait exactly 1 minute before the next check
+                logger.info("RUNNING")
                 time.sleep(60)
                 
             except Exception as e:
@@ -439,11 +481,13 @@ def main():
         print(f"Telegram notifications: {'Enabled' if scanner.telegram_config['enabled'] else 'Disabled'}")
         print("\nPress Ctrl+C to stop the scanner")
         print("=" * 60)
-        
+
+        if scanner.telegram_config['enabled']:
+            scanner.send_telegram_message("Crypto Trading Signal Scanner started successfully!")
+
         # Keep the main thread alive
         while True:
             try:
-                # print("---RUNNING---")
                 time.sleep(1)
             except KeyboardInterrupt:
                 print("\nShutting down scanner...")
