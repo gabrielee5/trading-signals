@@ -758,9 +758,9 @@ class ATRVolatilityStrategy(BaseStrategy):
             return {
                 'symbol': symbol,
                 'type': 'BUY',
-                'price': df_1h.iloc[-1]['close'],
+                'price': float(df_1h.iloc[-1]['close']), # modified formatting
                 'time': df_1h.iloc[-1]['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
-                'timeframe': '1h/3h',
+                'timeframe': '1h',
                 'strategy': self.name,
                 'atr': float(prev_3h['atr']),
                 'price_change': float(latest_3h['close_change'])
@@ -771,9 +771,9 @@ class ATRVolatilityStrategy(BaseStrategy):
             return {
                 'symbol': symbol,
                 'type': 'SELL',
-                'price': df_1h.iloc[-1]['close'],
+                'price': float(df_1h.iloc[-1]['close']),
                 'time': df_1h.iloc[-1]['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
-                'timeframe': '1h/3h',
+                'timeframe': '1h',
                 'strategy': self.name,
                 'atr': float(prev_3h['atr']),
                 'price_change': float(latest_3h['close_change'])

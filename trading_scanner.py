@@ -353,6 +353,19 @@ class TradingScanner:
             try:
                 signal = self.analyze_pair(symbol)
                 if signal:
+                    # Convert timestamp in signal to user's timezone if present
+                    if 'time' in signal and signal['time']:
+                        try:
+                            # Parse the timestamp and convert to user's timezone (+2)
+                            from datetime import timezone, timedelta
+                            dt = datetime.strptime(signal['time'], '%Y-%m-%d %H:%M:%S')
+                            dt = dt.replace(tzinfo=None)  # Ensure naive datetime
+                            dt_utc = dt.replace(tzinfo=timezone.utc)  # Treat as UTC
+                            dt_local = dt_utc.astimezone(timezone(timedelta(hours=2)))  # Convert to +2
+                            signal['time'] = dt_local.strftime('%Y-%m-%d %H:%M:%S')
+                        except Exception as e:
+                            logger.debug(f"Could not convert signal time to local timezone: {e}")
+                
                     signals.append(signal)
                     logger.info(f"Signal found: {signal}")
                     
