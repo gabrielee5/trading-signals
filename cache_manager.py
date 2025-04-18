@@ -29,7 +29,6 @@ class MarketDataCache:
         }
         self.max_cache_size_mb = max_cache_size_mb
         self.max_age_hours = max_age_hours
-        logger.info(f"Initialized market data cache (max size: {max_cache_size_mb}MB, max age: {max_age_hours}h)")
     
     def get(self, key):
         """

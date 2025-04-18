@@ -43,7 +43,23 @@ class BaseStrategy(ABC):
             dict or None: Signal dict if a signal is found, None otherwise
         """
         pass
-
+    
+    def get_complete_candle(self, df):
+        """
+        Returns the most recently completed candle, not the currently forming one.
+        
+        Args:
+            df (pd.DataFrame): DataFrame containing price data
+        
+        Returns:
+            pandas.Series: The most recently completed candle (second to last row)
+        """
+        if len(df) < 2:
+            return None
+        
+        # Return the second-to-last row, which is the most recently completed candle
+        return df.iloc[-2]
+    
 class SMACrossStrategy(BaseStrategy):
     """
     A simple moving average crossover strategy.
@@ -590,7 +606,7 @@ class SimplePriceStrategy(BaseStrategy):
     
     def get_timeframes(self):
         """Required timeframes for this strategy."""
-        return ['1m']
+        return ['5m']
     
     def get_scan_interval(self):
         """Scanning interval in seconds."""
@@ -607,21 +623,21 @@ class SimplePriceStrategy(BaseStrategy):
         Returns:
             dict or None: Trading signal if found, None otherwise
         """
-        # Get the 1m data for analysis
-        df = data['1m'].copy()
+        # Get the 5m data for analysis
+        df = data['5m'].copy()
         
-        # Need at least 2 candles
-        if len(df) < 2:
+        # Need at least 3 candles (2 completed + 1 current)
+        if len(df) < 3:
             return None
         
-        # Get the latest and previous candle
-        latest = df.iloc[-1]
-        previous = df.iloc[-2]
+        # Get the latest COMPLETED candle and the one before it
+        latest_complete = self.get_complete_candle(df)  # Second to last row
+        previous = df.iloc[-3]  # Third to last row
         
         # Simple condition: Buy if current close > previous close
-        if latest['close'] > previous['close']:
+        if latest_complete['close'] > previous['close']:
             # Convert numpy values to native Python float to prevent np.float64 in output
-            current_close = float(latest['close']) 
+            current_close = float(latest_complete['close']) 
             prev_close = float(previous['close'])
             
             # Return BUY signal
@@ -629,8 +645,8 @@ class SimplePriceStrategy(BaseStrategy):
                 'symbol': symbol,
                 'type': 'BUY',
                 'price': current_close,  # Using converted float
-                'time': latest['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
-                'timeframe': '1m',
+                'time': latest_complete['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+                'timeframe': '5m',
                 'strategy': self.name,
                 'prev_close': prev_close,  # Using converted float
                 'current_close': current_close  # Using converted float
@@ -638,7 +654,133 @@ class SimplePriceStrategy(BaseStrategy):
         
         # Could add a SELL signal when price drops, but keeping it simple for now
         return None
+
+class ATRVolatilityStrategy(BaseStrategy):
+    """
+    ATR-based volatility strategy.
+    Generates signals when price change exceeds a multiple of the ATR,
+    indicating a potential volatility breakout.
+    """
     
+    def __init__(self, atr_period=14, atr_multiplier=2.0):
+        """
+        Initialize the strategy parameters.
+        
+        Args:
+            atr_period (int): Period for ATR calculation
+            atr_multiplier (float): Multiplier for ATR to define breakout threshold
+        """
+        self.name = "ATR Volatility"
+        self.atr_period = atr_period
+        self.atr_multiplier = atr_multiplier
+    
+    def get_timeframes(self):
+        """Required timeframes for this strategy."""
+        return ['1h']
+    
+    def get_scan_interval(self):
+        """Scanning interval in seconds."""
+        return 300  # 5 minutes
+    
+    def _resample_data(self, df, target_timeframe='3h'):
+        """
+        Resample 1h data to 3h timeframe.
+        
+        Args:
+            df (pandas.DataFrame): DataFrame with 1h OHLCV data
+            target_timeframe (str): Target timeframe to resample to
+            
+        Returns:
+            pandas.DataFrame: Resampled dataframe
+        """
+        # Make a copy to avoid modifying the original
+        df = df.copy()
+        
+        # Ensure timestamp is the index for resampling
+        df = df.set_index('timestamp')
+        
+        # Define resampling rules
+        resampled = df.resample('3h').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        })
+        
+        # Reset index to get timestamp as a column again
+        resampled = resampled.reset_index()
+        
+        return resampled
+        
+    def analyze(self, symbol, data):
+        """
+        Analyze the data and return a signal if found.
+        
+        Args:
+            symbol (str): Symbol being analyzed
+            data (dict): Dictionary of DataFrames for each timeframe
+            
+        Returns:
+            dict or None: Signal dict if a signal is found, None otherwise
+        """
+        # Get the 1h data
+        df_1h = data['1h'].copy()
+        
+        # Need enough data for resampling
+        if len(df_1h) < 24:  # At least 8 3-hour candles
+            return None
+        
+        # Resample to 3h
+        df_3h = self._resample_data(df_1h)
+        
+        # Calculate ATR on 3h timeframe
+        df_3h['atr'] = average_true_range(df_3h, self.atr_period) * self.atr_multiplier
+        
+        # Calculate close price changes
+        df_3h['close_change'] = df_3h['close'].diff()
+        df_3h['abs_close_change'] = df_3h['close_change'].abs()
+        
+        # Need enough data after resampling
+        if len(df_3h) < self.atr_period + 2:
+            return None
+        
+        # Get latest data points
+        latest_3h = df_3h.iloc[-1]
+        prev_3h = df_3h.iloc[-2]
+        
+        # Check if values are valid
+        if np.isnan(latest_3h['close_change']) or np.isnan(prev_3h['atr']):
+            return None
+        
+        # Check for long signal - current close change > previous ATR
+        if latest_3h['close_change'] > prev_3h['atr']:
+            return {
+                'symbol': symbol,
+                'type': 'BUY',
+                'price': df_1h.iloc[-1]['close'],
+                'time': df_1h.iloc[-1]['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+                'timeframe': '1h/3h',
+                'strategy': self.name,
+                'atr': float(prev_3h['atr']),
+                'price_change': float(latest_3h['close_change'])
+            }
+        
+        # Check for short signal - current close change is negative and absolute value > previous ATR
+        if latest_3h['close_change'] < 0 and abs(latest_3h['close_change']) > prev_3h['atr']:
+            return {
+                'symbol': symbol,
+                'type': 'SELL',
+                'price': df_1h.iloc[-1]['close'],
+                'time': df_1h.iloc[-1]['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+                'timeframe': '1h/3h',
+                'strategy': self.name,
+                'atr': float(prev_3h['atr']),
+                'price_change': float(latest_3h['close_change'])
+            }
+        
+        return None
+
 # Factory function to get strategy instance
 def get_strategy(strategy_name="SMACrossStrategy"):
     """
@@ -655,7 +797,8 @@ def get_strategy(strategy_name="SMACrossStrategy"):
         "ATRBreakoutStrategy": ATRBreakoutStrategy(),
         "VolumeBreakoutStrategy": VolumeBreakoutStrategy(),
         "RSIStrategy": RSIStrategy(),
-        "SimplePriceStrategy": SimplePriceStrategy()
+        "SimplePriceStrategy": SimplePriceStrategy(),
+        "ATRVolatilityStrategy": ATRVolatilityStrategy(),
     }
     
     return strategies.get(strategy_name, SMACrossStrategy())
