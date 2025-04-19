@@ -513,6 +513,8 @@ class TradingScanner:
                     
                     if signals:
                         logger.info(f"Found {len(signals)} signals in this iteration")
+                    else:
+                        logger.info("No signals found in this iteration")
                 else:
                     logger.debug("No new candles available for processing")
                 
