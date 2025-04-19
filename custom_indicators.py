@@ -2,6 +2,8 @@
 # Implementation of common technical indicators without external TA libraries
 import numpy as np
 import pandas as pd
+from functools import lru_cache
+
 
 def simple_moving_average(data, period=14, column='close'):
     """
@@ -28,7 +30,7 @@ def simple_moving_average(data, period=14, column='close'):
 
 def average_true_range(data, period=14):
     """
-    Calculate Average True Range (ATR)
+    Calculate Average True Range (ATR) using vectorized operations
     
     Args:
         data (pd.DataFrame): DataFrame containing OHLC data
@@ -44,34 +46,32 @@ def average_true_range(data, period=14):
     if not all(col in data.columns for col in required_columns):
         raise ValueError(f"DataFrame must contain {required_columns} columns")
     
-    # Calculate True Range
+    # Get numpy arrays for calculation (faster than accessing DataFrame columns repeatedly)
     high = data['high'].values
     low = data['low'].values
     close = data['close'].values
     
-    # Create a shifted version of close
+    # Create shifted version of close
     prev_close = np.roll(close, 1)
     prev_close[0] = close[0]  # Set the first value to avoid NaN
     
-    # Calculate the three differences
-    tr1 = high - low  # Current high - current low
-    tr2 = np.abs(high - prev_close)  # Current high - previous close
-    tr3 = np.abs(low - prev_close)  # Current low - previous close
+    # Calculate the three differences all at once using numpy arrays
+    tr1 = high - low                  # Current high - current low
+    tr2 = np.abs(high - prev_close)   # Current high - previous close
+    tr3 = np.abs(low - prev_close)    # Current low - previous close
     
-    # True Range is the maximum of the three
+    # Get true range as the max of the three differences
+    # This vectorized approach is much faster than looping
     tr = np.maximum(tr1, np.maximum(tr2, tr3))
     
-    # Calculate ATR using Simple Moving Average of True Range
-    atr = np.zeros_like(tr)
+    # Allocate output array
+    atr = np.full_like(tr, np.nan)
     
-    # First ATR value is just the first period's simple average
-    first_valid_atr = np.nanmean(tr[:period])
+    # First ATR value is the average of the first period TR values
+    atr[period-1] = np.mean(tr[:period])
     
-    # Fill the initial values with NaN
-    atr[:period-1] = np.nan
-    atr[period-1] = first_valid_atr
-    
-    # Calculate the rest using the ATR formula: ATR = [(Prior ATR x (period-1)) + Current TR] / period
+    # Vectorized calculation of remaining ATR values
+    # Wilder's smoothing formula: ATR = ((Prior ATR * (period-1)) + Current TR) / period
     for i in range(period, len(tr)):
         atr[i] = ((atr[i-1] * (period-1)) + tr[i]) / period
     
@@ -284,3 +284,26 @@ def moving_average_convergence_divergence(data, fast_period=12, slow_period=26, 
     histogram = macd_line - signal_line
     
     return macd_line, signal_line, histogram
+
+@lru_cache(maxsize=128)
+def get_timeframe_seconds(timeframe):
+    """Cached version of timeframe to seconds conversion"""
+    timeframe_seconds = {
+        '1m': 60,
+        '3m': 3 * 60,
+        '5m': 5 * 60,
+        '15m': 15 * 60,
+        '30m': 30 * 60,
+        '1h': 60 * 60,
+        '2h': 2 * 60 * 60,
+        '4h': 4 * 60 * 60,
+        '6h': 6 * 60 * 60,
+        '8h': 8 * 60 * 60,
+        '12h': 12 * 60 * 60,
+        '1d': 24 * 60 * 60,
+        '3d': 3 * 24 * 60 * 60,
+        '1w': 7 * 24 * 60 * 60,
+        '1M': 30 * 24 * 60 * 60,
+    }
+    
+    return timeframe_seconds.get(timeframe, 60 * 60)  # Default to 1h

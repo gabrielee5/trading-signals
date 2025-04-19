@@ -14,6 +14,8 @@ from telegram.request import HTTPXRequest
 import asyncio
 from strategies_custom import get_strategy
 from cache_manager import MarketDataCache
+import concurrent.futures
+from functools import lru_cache, wraps
 
 # Set up logging
 logging.basicConfig(
@@ -26,6 +28,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger("trading_scanner")
 
+class RateLimiter:
+    def __init__(self, max_calls, period):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = []
+    
+    def __call__(self, func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            now = time.time()
+            # Remove old calls
+            self.calls = [call for call in self.calls if now - call < self.period]
+            
+            # Check if we've reached the limit
+            if len(self.calls) >= self.max_calls:
+                # Calculate sleep time
+                sleep_time = self.period - (now - self.calls[0])
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                    # Update our current time after sleeping
+                    now = time.time()
+                    # Clean calls list again after sleeping
+                    self.calls = [call for call in self.calls if now - call < self.period]
+            
+            # Add this call
+            self.calls.append(now)
+            
+            return func(*args, **kwargs)
+        return wrapper
+    
 class TradingScanner:
     """
     A class that continuously scans the market and generates trading signals
@@ -220,83 +252,124 @@ class TradingScanner:
             logger.error(f"Error updating pair list: {str(e)}")
             # In case of error, keep the previous pair list
     
+    @RateLimiter(max_calls=5, period=1.0)  # Max 3 calls per second
     def fetch_ohlcv(self, symbol, timeframe='1h', limit=100):
-        """
-        Fetch OHLCV (Open, High, Low, Close, Volume) data for a symbol.
-        Uses the MarketDataCache to minimize API calls.
-        
-        Args:
-            symbol (str): Symbol to fetch data for
-            timeframe (str): Timeframe (e.g., '1m', '5m', '1h', '1d')
-            limit (int): Number of candles to fetch
-            
-        Returns:
-            pandas.DataFrame: DataFrame with OHLCV data
-        """
-        # Create cache key
+        """Rate-limited version of fetch_ohlcv"""
+        # Original implementation
         cache_key = f"{symbol}_{timeframe}"
-        
-        # Check if we have fresh data in cache
-        timeframe_seconds = self.market_cache.get_timeframe_seconds(timeframe)
-        # For OHLCV data, we consider it fresh if it's less than half a candle old
-        fresh_threshold = timeframe_seconds * 0.5
-        
         cached_data = self.market_cache.get(cache_key)
         
         if cached_data is not None and not self.market_cache.should_update(cache_key, timeframe):
-            # Cache hit and data is fresh
             return cached_data
         
-        # If we have cached data but it needs updating
         if cached_data is not None:
             try:
                 # Get the last timestamp
                 last_timestamp = cached_data['timestamp'].iloc[-1]
                 if isinstance(last_timestamp, pd.Timestamp):
-                    # Convert pandas timestamp to milliseconds
                     since = int(last_timestamp.timestamp() * 1000)
                 else:
-                    # Assume it's already milliseconds
                     since = int(last_timestamp)
                 
-                # Fetch only new data
                 new_ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, since=since)
                 
                 if new_ohlcv and len(new_ohlcv) > 0:
-                    # Convert to DataFrame
                     new_df = pd.DataFrame(new_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     new_df['timestamp'] = pd.to_datetime(new_df['timestamp'], unit='ms')
-                    
-                    # Update cache with new data
                     updated_df = self.market_cache.update_ohlcv_data(cache_key, timeframe, new_df)
-                    
                     logger.debug(f"Updated {symbol} {timeframe} with {len(new_df)} new candles")
                     return updated_df
                 
-                # If no new data, return cached data
                 return cached_data
-                
+                    
             except Exception as e:
                 logger.warning(f"Error updating data for {symbol} {timeframe}: {str(e)}")
-                # Return cached data if update fails
                 return cached_data
         
-        # If no cache or update needed, fetch all data
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             
-            # Store in cache
             self.market_cache.set(cache_key, df)
-            
             logger.debug(f"Fetched {symbol} {timeframe} data ({len(df)} candles)")
             return df
-            
+                
         except Exception as e:
             logger.error(f"Error fetching OHLCV for {symbol}: {str(e)}")
             return None
     
+    def fetch_multiple_ohlcv(self, symbols, timeframe='1h', limit=100):
+        """
+        Fetch OHLCV data for multiple symbols with rate limiting
+        """
+        results = {}
+        symbols_to_fetch = []
+        
+        # Check cache first
+        for symbol in symbols:
+            cache_key = f"{symbol}_{timeframe}"
+            cached_data = self.market_cache.get(cache_key)
+            
+            if cached_data is not None and not self.market_cache.should_update(cache_key, timeframe):
+                # Cache hit and data is fresh
+                results[symbol] = cached_data
+            else:
+                symbols_to_fetch.append(symbol)
+        
+        # Fetch remaining symbols sequentially with rate limiting
+        # This is safer than parallel fetching to avoid rate limits
+        for symbol in symbols_to_fetch:
+            try:
+                results[symbol] = self.fetch_ohlcv(symbol, timeframe, limit)
+            except Exception as e:
+                logger.error(f"Error fetching OHLCV for {symbol}: {str(e)}")
+                results[symbol] = None
+        
+        return results
+
+    def analyze_multiple_pairs(self, symbols):
+        """
+        Analyze multiple pairs and return trading signals.
+        
+        Args:
+            symbols (list): Symbols to analyze
+            
+        Returns:
+            list: List of trading signals
+        """
+        signals = []
+        timeframes = self.strategy.get_timeframes()
+        
+        # Fetch data for each timeframe
+        timeframe_data = {}
+        for tf in timeframes:
+            timeframe_data[tf] = self.fetch_multiple_ohlcv(symbols, timeframe=tf)
+        
+        # Make a copy of symbols to avoid modification during iteration
+        symbols_to_analyze = symbols.copy()
+        
+        # Now analyze each symbol
+        for symbol in symbols_to_analyze:
+            try:
+                data = {}
+                has_all_data = True
+                
+                for tf in timeframes:
+                    data[tf] = timeframe_data[tf].get(symbol)
+                    if data[tf] is None or len(data[tf]) < 10:
+                        has_all_data = False
+                        break
+                
+                if has_all_data:
+                    signal = self.strategy.analyze(symbol, data)
+                    if signal:
+                        signals.append(signal)
+            except Exception as e:
+                logger.error(f"Error analyzing {symbol}: {str(e)}")
+        
+        return signals
+
     def analyze_pair(self, symbol):
         """
         Analyze a single pair and return trading signals.
@@ -329,65 +402,69 @@ class TradingScanner:
     
     def scan_market(self):
         """
-        Scan all pairs in the market for trading signals.
+        Scan all pairs in the market for trading signals with rate limiting
         """
-        signals = []
-        
         # Run cache maintenance
         self.market_cache.clean()
         
-        # Occasionally log cache statistics
+        # Log cache statistics if needed
         current_time = time.time()
-        if current_time - self.last_cache_stats_log > 3600:  # Once per hour
+        if current_time - self.last_cache_stats_log > 3600:
             cache_stats = self.market_cache.get_cache_stats()
-            logger.info(
-                f"Cache stats: {cache_stats['entries']} entries, "
-                f"{cache_stats['size_mb']:.2f}MB, "
-                f"Hit ratio: {cache_stats['hit_ratio']:.2f}, "
-                f"Hits: {cache_stats['hits']}, "
-                f"Misses: {cache_stats['misses']}"
-            )
+            logger.info(f"Cache stats: {cache_stats['entries']} entries, {cache_stats['size_mb']:.2f}MB, Hit ratio: {cache_stats['hit_ratio']:.2f}")
             self.last_cache_stats_log = current_time
         
-        for symbol in self.pairs:
+        # Use a smaller batch size to avoid rate limits
+        batch_size = 5  # Process 5 symbols at a time
+        all_signals = []
+        
+        # Process all pairs in batches
+        for i in range(0, len(self.pairs), batch_size):
+            batch_pairs = self.pairs[i:i+batch_size]
+            logger.debug(f"Processing batch {i//batch_size + 1}/{(len(self.pairs) + batch_size - 1)//batch_size}: {batch_pairs}")
+            
             try:
-                signal = self.analyze_pair(symbol)
-                if signal:
+                batch_signals = self.analyze_multiple_pairs(batch_pairs)
+                
+                # Process signals from this batch
+                for signal in batch_signals:
                     # Convert timestamp in signal to user's timezone if present
                     if 'time' in signal and signal['time']:
                         try:
                             # Parse the timestamp and convert to user's timezone (+2)
                             from datetime import timezone, timedelta
                             dt = datetime.strptime(signal['time'], '%Y-%m-%d %H:%M:%S')
-                            dt = dt.replace(tzinfo=None)  # Ensure naive datetime
-                            dt_utc = dt.replace(tzinfo=timezone.utc)  # Treat as UTC
-                            dt_local = dt_utc.astimezone(timezone(timedelta(hours=2)))  # Convert to +2
+                            dt = dt.replace(tzinfo=None)
+                            dt_utc = dt.replace(tzinfo=timezone.utc)
+                            dt_local = dt_utc.astimezone(timezone(timedelta(hours=2)))
                             signal['time'] = dt_local.strftime('%Y-%m-%d %H:%M:%S')
                         except Exception as e:
-                            logger.debug(f"Could not convert signal time to local timezone: {e}")
-                
-                    signals.append(signal)
+                            logger.debug(f"Could not convert signal time: {e}")
+                    
+                    all_signals.append(signal)
                     logger.info(f"Signal found: {signal}")
                     
                     # Notify via Telegram if enabled
                     if self.telegram_config["enabled"]:
                         message = f"*Signal Alert*\n"\
-                                 f"Symbol: {signal['symbol']}\n"\
-                                 f"Type: {signal['type']}\n"\
-                                 f"Price: {signal['price']:.8f}\n"\
-                                 f"Timeframe: {signal['timeframe']}\n"\
-                                 f"Strategy: {signal['strategy']}\n"\
-                                 f"Time: {signal['time']}"
+                                f"Symbol: {signal['symbol']}\n"\
+                                f"Type: {signal['type']}\n"\
+                                f"Price: {signal['price']:.8f}\n"\
+                                f"Timeframe: {signal['timeframe']}\n"\
+                                f"Strategy: {signal['strategy']}\n"\
+                                f"Time: {signal['time']}"
                         
                         self.send_telegram_message(message)
                 
-                # Add a small delay to avoid rate limiting
-                time.sleep(0.2)
+                # Add a small delay between batches to avoid rate limiting
+                time.sleep(0.5)
                 
             except Exception as e:
-                logger.error(f"Error processing {symbol}: {str(e)}")
+                logger.error(f"Error processing batch {batch_pairs}: {str(e)}")
+                # Continue with next batch even if this one fails
+                time.sleep(1)  # Slightly longer delay after error
         
-        return signals
+        return all_signals
     
     def _scanner_thread(self):
         """Thread function for continuous market scanning."""
