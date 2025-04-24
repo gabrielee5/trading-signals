@@ -2,8 +2,8 @@
 import asyncio
 import telegram
 
-token = "7764583995:AAFIbsZUG0Lg_8GDLkdU20y7QY3WGaFikUs"
-chat_id = "697220790"
+token = "abs"
+chat_id = "sdjfn"
 
 async def send_telegram_message():
     
